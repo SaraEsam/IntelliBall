@@ -1,0 +1,115 @@
+!pip install ultralytics deep_sort_realtime filterpy torch torchvision gradio nupmy
+import cv2
+import numpy as np
+import torch
+from ultralytics import YOLO
+from deep_sort_realtime.deepsort_tracker import DeepSort
+import gradio as gr
+from collections import deque
+import tempfile
+
+model = YOLO("yolov8x.pt")
+tracker = DeepSort(max_age=30)
+
+def analyze_offside(video_path):
+    cap = cv2.VideoCapture(video_path)
+    width, height = int(cap.get(3)), int(cap.get(4))
+    fps = int(cap.get(5))
+
+    temp_output = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    out = cv2.VideoWriter(temp_output.name, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+
+    ball_history = deque(maxlen=10)
+    frame_buffer = deque(maxlen=10)
+    pass_frame = None
+    offside_result = "❌ لم يتم اكتشاف لحظة تمرير واضحة."
+    decision_made = False
+
+    players_at_pass = []
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_buffer.append(frame.copy())
+
+        results = model(frame)[0]
+        detections = []
+        ball_pos = None
+        players = []
+
+        for result in results.boxes.data:
+            x1, y1, x2, y2, conf, cls = result.cpu().numpy()
+            class_id = int(cls)
+            if class_id == 0:  # Player
+                detections.append(([x1, y1, x2, y2], conf, class_id))
+            elif class_id == 32:  # Ball
+                ball_pos = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+
+        # تتبع اللاعبين
+        tracks = tracker.update_tracks(detections, frame=frame)
+        for track in tracks:
+            if track.is_confirmed() and track.time_since_update == 0:
+                track_id = track.track_id
+                ltrb = track.to_ltrb()
+                players.append((track_id, *ltrb))
+
+        ball_history.append(ball_pos)
+
+        if not decision_made and len(ball_history) >= 5:
+            prev = ball_history[-5]
+            curr = ball_history[-1]
+            if prev and curr:
+                dx = curr[0] - prev[0]
+                dy = curr[1] - prev[1]
+                dist = np.sqrt(dx ** 2 + dy ** 2)
+
+                if dist > 10:
+                    pass_frame = frame_buffer[-6]  # قبل التحرك
+                    players_at_pass = players.copy()
+
+                    if len(players_at_pass) >= 3:
+                        # نحسب المسافة من المرمى (x=0) لكل لاعب
+                        players_sorted = sorted(players_at_pass, key=lambda p: p[1])  # by x1
+                        last_two_defenders = players_sorted[:2]  # أقرب لاعبين للمرمى
+                        farthest_attacker = players_sorted[-1]  # أبعد مهاجم
+
+                        second_last_defender_x = max(last_two_defenders[0][1], last_two_defenders[1][1])
+                        attacker_x = farthest_attacker[1]
+
+                        offside = attacker_x < second_last_defender_x  # أقرب للمرمى
+
+                        label = "Offside!" if offside else "Not Offside"
+                        color = (0, 0, 255) if offside else (0, 255, 0)
+                        cv2.putText(pass_frame, label, (50, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.5, color, 3)
+
+                        # رسم الخط عند المدافع الثاني
+                        cv2.line(pass_frame, (int(second_last_defender_x), 0), (int(second_last_defender_x), height), color, 2)
+
+                        for _ in range(30):  # 1 ثانية
+                            out.write(pass_frame)
+
+                        offside_result = f"✅ النتيجة: {label}"
+                        decision_made = True
+                        continue
+
+        out.write(frame)
+
+    cap.release()
+    out.release()
+    return temp_output.name, offside_result
+
+# Gradio GUI
+def process(video):
+    return analyze_offside(video)
+
+demo = gr.Interface(
+    fn=process,
+    inputs=gr.Video(label="📥 أدخل فيديو التمريرة", format="mp4"),
+    outputs=[gr.Video(label="📤 الفيديو الناتج"), gr.Textbox(label="⚽ نتيجة التسلل")],
+    title="نظام كشف التسلل بالذكاء الاصطناعي 🎯",
+    description="يقوم بتحليل لحظة تمرير الكرة وحساب وضعية التسلل بدقة لحظة لمس الكرة."
+)
+
+demo.launch()
